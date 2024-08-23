@@ -9,6 +9,8 @@ from queue import Queue, Empty
 from pySX127x.LoRa import *
 from pySX127x.board_config import BOARD
 import time
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
 TUNSETIFF = 0x400454ca
 IFF_TAP = 0x0002
@@ -24,8 +26,12 @@ parser.add_argument('--mode', choices=['gateway', 'client'], required=True, help
 parser.add_argument('--device-id', type=int, required=True, help="Unique device ID (0 reserved for gateway)")
 parser.add_argument('--ip', type=str, help="IP address to connect to (only for client mode)")
 parser.add_argument('--lora-freq', type=float, default=915.0, help="LoRa frequency in MHz")
+parser.add_argument('--lora-channel', type=float, default=1, help="LoRa channel specification (e.g., 1 for default)")
 parser.add_argument('--retries', type=int, default=3, help="Number of retries for sending packets (only for client mode)")
 parser.add_argument('--timeout', type=float, default=2.0, help="Timeout for ACK (seconds, only for client mode)")
+parser.add_argument('--tap-device', type=str, default='tap0', help="TAP device name (only for client mode)")
+parser.add_argument('--encryption-key', type=str, help="Encryption key for securing communication")
+parser.add_argument('--lora-mode', choices=['LongFast', 'ShortSlow'], default='LongFast', help="Set the LoRa communication mode")
 args = parser.parse_args()
 
 # Unique ID and mode
@@ -33,15 +39,30 @@ DEVICE_ID = args.device_id
 MODE = args.mode
 RETRIES = args.retries
 TIMEOUT = args.timeout
+TAP_DEVICE = args.tap_device
+ENCRYPTION_KEY = args.encryption_key.encode() if args.encryption_key else None
+LORA_MODE = args.lora_mode
 
 # LoRa setup
 BOARD.setup()
 lora = LoRa(verbose=False)
 lora.set_mode(MODE.SLEEP)
 lora.set_dio_mapping([0] * 6)
-lora.set_freq(args.lora_freq)
-lora.set_bw(BW.BW500)
-lora.set_spreading_factor(SF.SF7)
+
+# Set the frequency based on the channel
+if args.lora_channel == 1:
+    lora.set_freq(args.lora_freq)
+else:
+    lora.set_freq(args.lora_freq + (args.lora_channel * 0.2))  # Adjust frequency based on channel
+
+# Set mode parameters
+if LORA_MODE == 'LongFast':
+    lora.set_bw(BW.BW500)
+    lora.set_spreading_factor(SF.SF7)
+elif LORA_MODE == 'ShortSlow':
+    lora.set_bw(BW.BW125)
+    lora.set_spreading_factor(SF.SF12)
+
 lora.set_pa_config(pa_select=1, max_power=0x04, output_power=0x0F)
 lora.set_mode(MODE.STDBY)
 
@@ -50,8 +71,22 @@ DEVICE_IP_MAP = {}  # Map LoRa device IDs to their IP addresses (only for gatewa
 seq_num = 0  # Sequence number for packets
 
 
+def encrypt_data(data, key):
+    """Encrypt data using AES encryption."""
+    cipher = AES.new(key, AES.MODE_ECB)
+    return cipher.encrypt(pad(data, AES.block_size))
+
+
+def decrypt_data(data, key):
+    """Decrypt data using AES encryption."""
+    cipher = AES.new(key, AES.MODE_ECB)
+    return unpad(cipher.decrypt(data), AES.block_size)
+
+
 def encapsulate_packet(device_id, packet_type, sequence_num, data):
     """Encapsulate the data into a packet with a unified format including a sequence number."""
+    if ENCRYPTION_KEY:
+        data = encrypt_data(data, ENCRYPTION_KEY)
     payload_length = len(data)
     if payload_length > 251:
         raise ValueError("Payload too large to fit in the packet")
@@ -69,6 +104,9 @@ def on_rx_done():
         payload_length = payload[2]
         sequence_num = payload[3]
         data = bytes(payload[4:4 + (payload_length - 1)])
+
+        if ENCRYPTION_KEY:
+            data = decrypt_data(data, ENCRYPTION_KEY)
 
         if MODE == 'gateway':
             handle_gateway_rx(device_id, packet_type, sequence_num, data)
@@ -131,10 +169,10 @@ def read_thread():
             lora.set_mode(MODE.RXCONT)  # Set to receive mode after sending
 
 
-def tap_interface_setup():
+def tap_interface_setup(tap_device):
     """Setup the TAP interface for communication."""
     tap = os.open('/dev/net/tun', os.O_RDWR)
-    ifr = struct.pack('16sH', b'tap0', IFF_TAP | IFF_NO_PI)
+    ifr = struct.pack('16sH', tap_device.encode(), IFF_TAP | IFF_NO_PI)
     fcntl.ioctl(tap, TUNSETIFF, ifr)
     return tap
 
@@ -164,38 +202,4 @@ def send_with_ack(packet, sequence_num):
             if ack_received == sequence_num:
                 return True
         except Empty:
-            print(f"No ACK received for Seq: {sequence_num}, retrying...")
-
-    return False
-
-
-def gateway_mode():
-    """Main loop for gateway mode."""
-    # Example mapping (this would be more dynamic in a real scenario)
-    DEVICE_IP_MAP[1] = "192.168.1.100"
-    DEVICE_IP_MAP[2] = "192.168.1.101"
-    # Continuously handle LoRa communication in a separate thread
-    write_thread = threading.Thread(target=read_thread, daemon=True)
-    write_thread.start()
-
-
-# Set LoRa to continuous receive mode
-lora.set_mode(MODE.RXCONT)
-lora.on_rx_done = on_rx_done
-
-# Execute based on the mode
-if MODE == 'gateway':
-    gateway_mode()
-elif MODE == 'client':
-    tap = tap_interface_setup()
-    read_thread = threading.Thread(target=read_thread, daemon=True)
-    read_thread.start()
-    client_mode(tap)
-
-# Keep the main thread alive
-try:
-    while True:
-        pass
-except KeyboardInterrupt:
-    print("Exiting...")
-    BOARD.teardown()
+            print(f"No ACK received for Seq:
